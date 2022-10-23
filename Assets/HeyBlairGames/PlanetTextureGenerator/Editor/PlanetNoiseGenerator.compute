@@ -1,0 +1,837 @@
+﻿static const float	PI						= 3.14159265;
+
+static const int	strideGrad				= 12 * 3;
+static const int	stridePerm				= 512;
+
+static const int	diffusePixelsPerThread	= 3;
+static const int	cityPixelsPerThread		= 1;
+static const int	cloudPixelsPerThread	= 2;
+
+static const int	surfaceNoiseOffset		= 0;
+static const int	landNoiseOffset			= 1;
+static const int	landColour01NoiseOffset	= 2;
+static const int	landColour23NoiseOffset	= 3;
+static const int	cloudNoiseOffset		= 0;
+
+int		threadOffset;
+
+float	width;
+float	height;
+
+//perlin noise data
+StructuredBuffer< float >	perlinGrad;
+StructuredBuffer< uint >	perlinPerm;
+
+RWStructuredBuffer< int >	resultData;
+
+//0 <= result <= 0.5, 0 = equator
+float getSphericalDistortion( int y )
+{
+	y				= ( y + height ) % height;
+	float result	= abs( ( ( float ) y / height ) - 0.5 );
+	return result;
+}
+
+float fade( float t)
+{
+	float result = t * t * t * ( t * ( t * 6 - 15 ) + 10 );
+	return result;
+}
+
+float _noisePerlin( float x, float y, float z, int offsetGrad, int offsetPerm )
+{
+	offsetGrad		*= strideGrad;
+	offsetPerm		*= stridePerm;
+
+	int X			= floor( x );
+	int Y			= floor( y );
+	int Z			= floor( z );
+	x				= x - X;
+	y				= y - Y;
+	z				= z - Z;
+	X				= ( X & 255 ) + offsetPerm;
+	Y				= ( Y & 255 ) + offsetPerm;
+	Z				= ( Z & 255 ) + offsetPerm;
+
+	int gi000		= ( perlinPerm[ X + perlinPerm[ Y + perlinPerm[ Z ] ] ] % 12 ) * 3 + offsetGrad;
+	int gi001		= ( perlinPerm[ X + perlinPerm[ Y + perlinPerm[ Z + 1 ] ] ] % 12 ) * 3 + offsetGrad;
+	int gi010		= ( perlinPerm[ X + perlinPerm[ Y + 1 + perlinPerm[ Z ] ] ] % 12 ) * 3 + offsetGrad;
+	int gi011		= ( perlinPerm[ X + perlinPerm[ Y + 1 + perlinPerm[ Z + 1 ] ] ] % 12 ) * 3 + offsetGrad;
+	int gi100		= ( perlinPerm[ X + 1 + perlinPerm[ Y + perlinPerm[ Z ] ] ] % 12 ) * 3 + offsetGrad;
+	int gi101		= ( perlinPerm[ X + 1 + perlinPerm[ Y + perlinPerm[ Z + 1 ] ] ] % 12 ) * 3 + offsetGrad;
+	int gi110		= ( perlinPerm[ X + 1 + perlinPerm[ Y + 1 + perlinPerm[ Z ] ] ] % 12 ) * 3 + offsetGrad;
+	int gi111		= ( perlinPerm[ X + 1 + perlinPerm[ Y + 1 + perlinPerm[ Z + 1 ] ] ] % 12 ) * 3 + offsetGrad;
+
+	float n000		= dot( float3( perlinGrad[ gi000 ], perlinGrad[ gi000 + 1 ], perlinGrad[ gi000 + 2 ] ), float3( x, y, z ) );
+	float n100		= dot( float3( perlinGrad[ gi100 ], perlinGrad[ gi100 + 1 ], perlinGrad[ gi100 + 2 ] ), float3( x - 1, y, z ) );
+	float n010		= dot( float3( perlinGrad[ gi010 ], perlinGrad[ gi010 + 1 ], perlinGrad[ gi010 + 2 ] ), float3( x, y - 1, z ) );
+	float n110		= dot( float3( perlinGrad[ gi110 ], perlinGrad[ gi110 + 1 ], perlinGrad[ gi110 + 2 ] ), float3( x - 1, y - 1, z ) );
+	float n001		= dot( float3( perlinGrad[ gi001 ], perlinGrad[ gi001 + 1 ], perlinGrad[ gi001 + 2 ] ), float3( x, y, z - 1 ) );
+	float n101		= dot( float3( perlinGrad[ gi101 ], perlinGrad[ gi101 + 1 ], perlinGrad[ gi101 + 2 ] ), float3( x - 1, y, z - 1 ) );
+	float n011		= dot( float3( perlinGrad[ gi011 ], perlinGrad[ gi011 + 1 ], perlinGrad[ gi011 + 2 ] ), float3( x, y - 1, z - 1 ) );
+	float n111		= dot( float3( perlinGrad[ gi111 ], perlinGrad[ gi111 + 1 ], perlinGrad[ gi111 + 2 ] ), float3( x - 1, y - 1, z - 1 ) );
+
+	float u			= fade( x );
+	float v			= fade( y );
+	float w			= fade( z );
+	
+	float nx00		= lerp( n000, n100, u );
+	float nx01		= lerp( n001, n101, u );
+	float nx10		= lerp( n010, n110, u );
+	float nx11		= lerp( n011, n111, u );
+	float nxy0		= lerp( nx00, nx10, v );
+	float nxy1		= lerp( nx01, nx11, v );
+	float result	= lerp( nxy0, nxy1, w );
+	
+	return result;
+}
+
+float noisePerlin( float3 pos, int offsetGrad, int offsetPerm )
+{
+	float result = 0.5 * _noisePerlin( pos.x, pos.y, pos.z, offsetGrad, offsetPerm ) + 0.5;
+	return result;
+}
+
+float3 getPointOnSphere( float u, float v )
+{
+	float s = PI * u * 2;
+	float t = PI * v;
+
+	float3 result = float3( sin( t ) * cos( s ), sin( t ) * sin( s ), cos( t ) );
+	return result;
+}
+		
+float getNormalisedOctavePerlin( float3 pos, int octaves, int offsetGrad, int offsetPerm )
+{
+	float result	= 0;
+	float scale		= 1;
+
+	for( int i = 0; i < octaves; ++i )
+	{
+		result	+= noisePerlin( pos * scale, offsetGrad, offsetPerm ) / scale;
+		scale	*= 2;
+	}
+
+	float l	= 2 - ( 1 / pow( 2, max( octaves - 1, 0 ) ) );
+	result	/= l;
+	return result;
+}
+
+float getOctavePerlin( float3 pos, int octaves, int offsetGrad, int offsetPerm )
+{
+	float result	= 0;
+	float scale		= 1;
+
+	for( int i = 0; i < octaves; ++i )
+	{
+		result	+= noisePerlin( pos * scale, offsetGrad, offsetPerm ) / scale;
+		scale	*= 2;
+	}
+
+	return result;
+}
+
+float sample( float3 pos,
+				float scale,
+				int octaves,
+				float falloff,
+				float intensity,
+				float ridginess,
+				float smearScale,
+				int smearOctaves,
+				float smearFalloff,
+				float smearIntensity,
+				int offsetGrad,
+				int offsetPerm )
+{
+	float result	= 0;
+	float offset	= 0;
+
+	if( smearOctaves > 0 )
+	{
+		offset = getOctavePerlin( pos / smearScale, smearOctaves, offsetGrad, offsetPerm );
+		offset = pow( abs( offset ), smearFalloff );
+		offset *= smearIntensity;
+	}
+
+	result = getNormalisedOctavePerlin( ( pos / scale ) + float3( offset, offset, offset ), octaves, offsetGrad, offsetPerm );
+
+	if( ridginess > 0 )
+	{
+		float ridge	= getNormalisedOctavePerlin( ( pos / scale ) + float3( offset, offset, offset + 11 ), octaves, offsetGrad, offsetPerm );
+		result		= ( ridginess * ( 1 - ( abs( ridge - 0.5 ) * 2 ) ) ) + ( ( 1 - ridginess ) * result );
+	}
+
+	result = pow( abs( result ), falloff );
+	result = clamp( result * intensity, 0, 1 );
+
+	return result;
+}
+
+float4 getSurfaceColour( float3 pos,
+							float scale,
+							int octaves,
+							float falloff,
+							float intensity,
+							float ridginess,
+							float smearScale,
+							int smearOctaves,
+							float smearFalloff,
+							float smearIntensity,
+							float4 colour0,
+							float4 colour1,
+							int offsetGrad,
+							int offsetPerm )
+{
+	float c = sample( pos,
+						scale,
+						octaves,
+						falloff,
+						intensity,
+						ridginess,
+						smearScale,
+						smearOctaves,
+						smearFalloff,
+						smearIntensity,
+						offsetGrad,
+						offsetPerm );
+	float4 result = lerp( colour0, colour1, 1 - c );
+	return result;
+}
+
+float getSurfaceHeight( float3 pos,
+						float scale,
+						int octaves,
+						float falloff,
+						float intensity,
+						float ridginess,
+						float smearScale,
+						int smearOctaves,
+						float smearFalloff,
+						float smearIntensity,
+						int offsetGrad,
+						int offsetPerm )
+{
+	float result = sample( pos,
+							scale,
+							octaves,
+							falloff,
+							intensity,
+							ridginess,
+							smearScale,
+							smearOctaves,
+							smearFalloff,
+							smearIntensity,
+							offsetGrad,
+							offsetPerm );
+	return result;
+}
+
+
+#pragma kernel diffuseNoiseKernel
+
+//surface noise data
+float	surfaceScale;
+int		surfaceOctaves;
+float	surfaceFalloff;
+float	surfaceIntensity;
+float	surfaceRidginess;
+float	surfaceSmearScale;
+int		surfaceSmearOctaves;
+float	surfaceSmearFalloff;
+float	surfaceSmearIntensity;
+
+//land noise data
+float	landScale;
+int		landOctaves;
+float	landFalloff;
+float	landIntensity;
+float	landRidginess;
+float	landSmearScale;
+int		landSmearOctaves;
+float	landSmearFalloff;
+float	landSmearIntensity;
+
+float4	landColour0;
+float4	landColour1;
+float4	landColour2;
+float4	landColour3;
+
+//land colour01 noise data
+float	landColour01Scale;
+int		landColour01Octaves;
+float	landColour01Falloff;
+float	landColour01Intensity;
+float	landColour01Ridginess;
+float	landColour01SmearScale;
+int		landColour01SmearOctaves;
+float	landColour01SmearFalloff;
+float	landColour01SmearIntensity;
+
+//land colour23 noise data
+float	landColour23Scale;
+int		landColour23Octaves;
+float	landColour23Falloff;
+float	landColour23Intensity;
+float	landColour23Ridginess;
+float	landColour23SmearScale;
+int		landColour23SmearOctaves;
+float	landColour23SmearFalloff;
+float	landColour23SmearIntensity;
+
+float	cityReach;
+float	cityHeight;
+float4	waterColour0;
+float4	waterColour1;
+float	waterLevel;
+float	waterSpecular;
+float	waterFalloff;
+float4	iceColour;
+float	iceReach;
+float	iceHeight;
+float	shadowRange;
+float	shadowStrength;
+float	normalScale;
+
+//if you change the numthreads count here, you'll need to
+//update _diffuseThreadsPerGroup in PlanetNoiseGenerator.cs
+[ numthreads( 128, 1, 1 ) ]
+void diffuseNoiseKernel( uint3 id : SV_DispatchThreadID )
+{
+	int i		= id.x + threadOffset;
+
+	int y		= floor( i / width );
+	int x		= i - ( width * y );
+	
+	float inW	= 1 / ( width - 1 );
+	float inH	= 1 / ( height - 1 );
+
+	float u		= x * inW;
+	float v		= y * inH;
+
+	float3 p	= getPointOnSphere( u, v );
+	float h		= getSurfaceHeight( p,
+									surfaceScale,
+									surfaceOctaves,
+									surfaceFalloff,
+									surfaceIntensity,
+									surfaceRidginess,
+									surfaceSmearScale,
+									surfaceSmearOctaves,
+									surfaceSmearFalloff,
+									surfaceSmearIntensity,
+									surfaceNoiseOffset,
+									surfaceNoiseOffset );
+
+	float dr	= 1;
+
+	if( h > waterLevel )
+	{
+		float4 c	= iceColour;
+		float ir	= iceReach - ( h * 0.1 );
+		float ao	= 1;
+
+		//land colour
+		if( h <= iceHeight && v > ir && v < 1 - ir )
+		{
+			float4 c0	= getSurfaceColour( p,
+											landColour01Scale,
+											landColour01Octaves,
+											landColour01Falloff,
+											landColour01Intensity,
+											landColour01Ridginess,
+											landColour01SmearScale,
+											landColour01SmearOctaves,
+											landColour01SmearFalloff,
+											landColour01SmearIntensity,
+											landColour0,
+											landColour1,
+											landColour01NoiseOffset,
+											landColour01NoiseOffset );
+			float4 c1	= getSurfaceColour( p,
+											landColour23Scale,
+											landColour23Octaves,
+											landColour23Falloff,
+											landColour23Intensity,
+											landColour23Ridginess,
+											landColour23SmearScale,
+											landColour23SmearOctaves,
+											landColour23SmearFalloff,
+											landColour23SmearIntensity,
+											landColour2,
+											landColour3,
+											landColour23NoiseOffset,
+											landColour23NoiseOffset );
+			c			= getSurfaceColour( p,
+											landScale,
+											landOctaves,
+											landFalloff,
+											landIntensity,
+											landRidginess,
+											landSmearScale,
+											landSmearOctaves,
+											landSmearFalloff,
+											landSmearIntensity,
+											c0,
+											c1,
+											landNoiseOffset,
+											landNoiseOffset );
+		}
+
+		//height and normals
+		float3 px	= getPointOnSphere( ( x + dr ) * inW, v );
+		float3 py	= getPointOnSphere( u, ( y + dr ) * inH );
+
+		float hx	= getSurfaceHeight( px,
+										surfaceScale,
+										surfaceOctaves,
+										surfaceFalloff,
+										surfaceIntensity,
+										surfaceRidginess,
+										surfaceSmearScale,
+										surfaceSmearOctaves,
+										surfaceSmearFalloff,
+										surfaceSmearIntensity,
+										surfaceNoiseOffset,
+										surfaceNoiseOffset );
+		float hy	= getSurfaceHeight( py,
+										surfaceScale,
+										surfaceOctaves,
+										surfaceFalloff,
+										surfaceIntensity,
+										surfaceRidginess,
+										surfaceSmearScale,
+										surfaceSmearOctaves,
+										surfaceSmearFalloff,
+										surfaceSmearIntensity,
+										surfaceNoiseOffset,
+										surfaceNoiseOffset );
+		
+		float3 n	= float3( dr * inW, 0, hx - h );
+		n			*= 1000;			//prevents rounding errors in cross product below
+		float3 cr	= float3( 0, dr * inH, hy - h );
+		cr			*= 1000;			//prevents rounding errors in cross product below
+		n			= normalize( cross( n, cr ) );
+
+		ao			= 1 - ( ( 1 - clamp( dot( n, float3( 0, 0, 1 ) ) * shadowRange, 0, 1 ) ) * shadowStrength );
+
+		n			= ( n * normalScale * 0.5 ) + ( float3( 1, 1, 1 ) * 0.5 );
+		h			= ( h - waterLevel ) / ( 1 - waterLevel );
+
+		resultData[ id.x * diffusePixelsPerThread + 1 ] = ( uint ) round( n.x * 255 ) << 24
+														| ( uint ) round( n.y * 255 ) << 16
+														| ( uint ) round( n.z * 255 ) << 8
+														| ( uint ) round( h * 255 );
+
+		//set land colour here after calculating ao
+		resultData[ id.x * diffusePixelsPerThread ] = ( uint ) round( c.r * 255 * ao ) << 24
+													| ( uint ) round( c.g * 255 * ao ) << 16
+													| ( uint ) round( c.b * 255 * ao ) << 8
+													| 0;
+		
+		//city illumination
+		resultData[ id.x * diffusePixelsPerThread + 2 ] = 0;
+
+		if( h < cityHeight )
+		{
+			float cityLowerLimit	= 0.5 - cityReach;
+			float cityUpperLimit	= 0.5 + cityReach;
+			float cityDivisor		= cityLowerLimit;
+						
+			if( v < 0.5 - cityReach )
+				resultData[ id.x * diffusePixelsPerThread + 2 ] = ( uint ) round( 255 * pow( abs( v / cityDivisor ), 3 ) ) << 24;
+			else if( v > 0.5 + cityReach )
+				resultData[ id.x * diffusePixelsPerThread + 2 ] = ( uint ) round( 255 * pow( abs( ( cityLowerLimit - ( v - cityUpperLimit ) ) / cityDivisor ), 3 ) ) << 24;
+			else
+				resultData[ id.x * diffusePixelsPerThread + 2 ] = 255 << 24;
+		}
+	}
+	else
+	{
+		float4 c	= iceColour;
+		float ir	= iceReach - ( h * 0.2 );
+		float spec	= 0;
+		float ao	= 1;
+
+		//water colour
+		if( h <= iceHeight && v > ir && v < 1 - ir )
+		{
+			float s		= pow( abs( h / waterLevel ), waterFalloff );
+			float q1	= 6 * pow( abs( s ), 5 ) - 15 * pow( abs( s ), 4 ) + 10 * pow( abs( s ), 3 );
+			float q0	= 1 - q1;
+
+			c			= ( waterColour0 * q0 ) + ( waterColour1 * q1 );
+
+			spec		= waterSpecular;
+		}
+
+		//height and normals for polar caps, none for water
+		if( h <= iceHeight && v > ir && v < 1 - ir )
+		{
+			resultData[ id.x * diffusePixelsPerThread + 1 ] = 128 << 24
+															| 128 << 16
+															| 255 << 8
+															| 0;
+		}
+		else
+		{
+			h			= abs( waterLevel - h ) + waterLevel;					//invert height below water to height above water
+
+			float3 px	= getPointOnSphere( ( x + dr ) * inW, v );
+			float3 py	= getPointOnSphere( u, ( y + dr ) * inH );
+
+			float hx	= abs( waterLevel - getSurfaceHeight( px,
+																surfaceScale,
+																surfaceOctaves,
+																surfaceFalloff,
+																surfaceIntensity,
+																surfaceRidginess,
+																surfaceSmearScale,
+																surfaceSmearOctaves,
+																surfaceSmearFalloff,
+																surfaceSmearIntensity,
+																0,
+																0 ) ) + waterLevel;
+			float hy	= abs( waterLevel - getSurfaceHeight( py,
+																surfaceScale,
+																surfaceOctaves,
+																surfaceFalloff,
+																surfaceIntensity,
+																surfaceRidginess,
+																surfaceSmearScale,
+																surfaceSmearOctaves,
+																surfaceSmearFalloff,
+																surfaceSmearIntensity,
+																0,
+																0 ) ) + waterLevel;
+			
+			float3 n	= float3( dr * inW, 0, hx - h );
+			n			*= 1000;			//prevents rounding errors in cross product below
+			float3 cr	= float3( 0, dr * inH, hy - h );
+			cr			*= 1000;			//prevents rounding errors in cross product below
+
+			n			= normalize( cross( n, cr ) );
+			n			= ( n * normalScale * 0.5 ) + ( float3( 1, 1, 1 ) * 0.5 );
+			h			= ( h - waterLevel ) / ( 1 - waterLevel );
+
+			resultData[ id.x * diffusePixelsPerThread + 1 ] = ( uint ) round( n.x * 255 ) << 24
+															| ( uint ) round( n.y * 255 ) << 16
+															| ( uint ) round( n.z * 255 ) << 8
+															| ( uint ) round( h * 255 );
+		}
+
+		//set colour here after calculating ao
+		resultData[ id.x * diffusePixelsPerThread ] = ( uint ) round( c.r * 255 * ao ) << 24
+													| ( uint ) round( c.g * 255 * ao ) << 16
+													| ( uint ) round( c.b * 255 * ao ) << 8
+													| ( uint ) round( spec * 255 );
+
+		//no city illumination
+		resultData[ id.x * diffusePixelsPerThread + 2 ] = 0;
+	}
+}
+
+
+#pragma kernel cityNoiseKernel
+
+//this matches the CitySplatData struct in PlanetNoiseGenerator.cs
+struct CitySplatData
+{
+	int		x;
+	int		y;
+	float	spread;
+	float	intensity;
+};
+
+float	cityMaxIntensity;
+float	cityFalloff;
+int		diffuseStartIndexC;
+int		splatCount;
+
+StructuredBuffer< CitySplatData >	splatData;
+RWStructuredBuffer< float >			resultDataCity;
+
+//if you change the numthreads count here, you'll need to
+//update _cityThreadsPerGroup in PlanetNoiseGenerator.cs
+[ numthreads( 128, 1, 1 ) ]
+void cityNoiseKernel( uint3 id : SV_DispatchThreadID )
+{
+	int index				= id.x * cityPixelsPerThread;
+
+	float diffuseMultiplier	= ( float ) resultData[ threadOffset + index ] / ( float ) 255;
+	float expFalloff		= ( float ) 1 / exp( cityFalloff );
+
+	float val				= 0;
+
+	int y					= floor( ( threadOffset + index ) / width );
+	int x					= ( threadOffset + index ) - ( width * y );
+
+	float referenceWidth	= 8192;
+	float referenceHeight	= referenceWidth * 0.5;
+
+	//this if is faster than just going through the array each time
+	if( resultData[ threadOffset + index ] > 0 )
+	{
+		for( int i = 0; i < splatCount; ++i )
+		{
+			CitySplatData citySplat = splatData[ i ];
+
+			int intSpread			= round( citySplat.spread );
+
+			//max avoids an if to check for division by zero
+			float spreadTop			= max( ( 0.5 - getSphericalDistortion( citySplat.y - intSpread ) ) * 2, 0.00000001 );
+			float spreadBottom		= max( ( 0.5 - getSphericalDistortion( citySplat.y + intSpread ) ) * 2, 0.00000001 );
+
+			float spreadDistortion	= min( citySplat.spread / min( spreadTop, spreadBottom ), width * 0.5 );
+
+			float invSpread			= ( float ) 1 / citySplat.spread;
+
+			float iDistortion		= ( ( citySplat.x - x ) / round( spreadDistortion ) ) * citySplat.spread + citySplat.x;
+			float xi				= ( float ) ( ( citySplat.x - iDistortion ) * ( citySplat.x - iDistortion ) );
+			xi						= ( xi / width ) * referenceWidth;
+			float xj				= ( float ) ( ( citySplat.y - y ) * ( citySplat.y - y ) );
+			xj						= ( xj / height ) * referenceHeight;
+			
+			float dist				= max( citySplat.spread - sqrt( xi + xj ), 0 ) * invSpread;
+
+			val						+= ( ( citySplat.intensity * dist ) * expFalloff ) * dist;
+			val						= min( val, cityMaxIntensity );
+		}
+	}
+
+	resultDataCity[ index ]	= val * diffuseMultiplier;
+}
+
+
+//Poisson distribution - mean density = 4, max points = 9
+uint getPointProbabilityCount( uint value )
+{
+	if( value < 393325350u )	return 1u;
+	if( value < 1022645910u )	return 2u;
+	if( value < 1861739990u )	return 3u;
+	if( value < 2700834071u )	return 4u;
+	if( value < 3372109335u )	return 5u;
+	if( value < 3819626178u )	return 6u;
+	if( value < 4075350088u )	return 7u;
+	if( value < 4203212043u )	return 8u;
+	return 9u;
+}
+
+//linear congruential generator - c values
+uint randomLCG( uint lastValue )
+{
+	uint result = 1103515245u * lastValue + 12345u;
+	return result;
+}
+
+uint hashFNV( uint i, uint j, uint k )
+{
+	uint OFFSET_BASIS	= 2166136261;
+	uint FNV_PRIME		= 16777619;
+
+	uint result			= OFFSET_BASIS ^ i;
+	result				*= FNV_PRIME;
+	result				^= j;
+	result				*= FNV_PRIME;
+	result				^= k;
+	result				*= FNV_PRIME;
+
+	return result;
+}
+
+float noiseWorley( float3 pos, int seed )
+{
+	float result	= 0xffffff;
+			
+	int cellX		= floor( pos.x );
+	int cellY		= floor( pos.y );
+	int cellZ		= floor( pos.z );
+
+	//1f / 0xffffffff was giving slightly different results in compute shader so just use calculated value
+	float diffDiv	= 0.0000000002328306;
+
+	for( int i = cellX - 1; i <= cellX + 1; ++i )
+	{
+		for( int j = cellY - 1; j <= cellY + 1; ++j )
+		{
+			for( int k = cellZ - 1; k <= cellZ + 1; ++k )
+			{
+				uint hash		= hashFNV( ( uint ) ( i + seed ), ( uint ) j, ( uint ) k );
+				uint random		= randomLCG( hash );
+						
+				uint pointCount	= getPointProbabilityCount( random );
+						
+				for( uint a = 0; a < pointCount; ++a )
+				{
+					random			= randomLCG( random );
+					float diffX		= random * diffDiv;
+
+					random			= randomLCG( random );
+					float diffY		= random * diffDiv;
+
+					random			= randomLCG( random );
+					float diffZ		= random * diffDiv;
+
+					float3 p		= pos - float3( diffX + i, diffY + j, diffZ + k );
+					p				*= p;
+					float sqrDist	= p.x + p.y + p.z;
+					result			= min( result, sqrDist );
+				}
+			}
+		}
+	}
+
+	result = clamp( result, 0, 1 );
+	return result;
+}
+
+float getOctaveWorley( float3 pos, int octaves, float amplitude, int seed )
+{
+	float result	= 0;
+	float scale		= 1;
+		
+	for( int i = 0; i < octaves; ++i )
+	{
+		result	+= noiseWorley( pos * scale, seed ) * ( amplitude / scale );
+		scale	*= 2;
+	}
+
+	return result;
+}
+
+
+#pragma kernel cloudNoiseKernel
+
+int		cloudSeed;
+
+//cloud noise data
+float	cloudScale;
+int		cloudOctaves;
+float	cloudFalloff;
+float	cloudIntensity;
+float	cloudRidginess;
+float	cloudSmearScale;
+int		cloudSmearOctaves;
+float	cloudSmearFalloff;
+float	cloudSmearIntensity;
+
+//cloud worley noise data
+int		cloudWorleyNoiseOctaves;
+float	cloudWorleyNoiseFrequency;
+float	cloudWorleyNoiseAmplitude;
+
+float	cloudShadowRange;
+float	cloudShadowStrength;
+
+//cloud params
+float4	cloudColour0;
+float4	cloudColour1;
+float	cloudSpin;
+float	cloudNormalScale;
+int		preMultiplyAlpha;
+
+//if you change the numthreads count here, you'll need to
+//update _cloudThreadsPerGroup in PlanetNoiseGenerator.cs
+[ numthreads( 128, 1, 1 ) ]
+void cloudNoiseKernel( uint3 id : SV_DispatchThreadID )
+{
+	int i		= id.x + threadOffset;
+
+	int y		= floor( i / width );
+	int x		= i - ( width * y );
+		
+	float inW	= 1 / ( width - 1 );
+	float inH	= 1 / ( height - 1 );
+
+	float u		= x * inW;
+	float v		= y * inH;
+
+	float dr	= 1;
+
+	float3 p	= getPointOnSphere( u, v );
+	p.x			/= cloudSpin;
+	p.y			/= cloudSpin;
+
+	//colour
+	float4 c = getSurfaceColour( p,
+									cloudScale,
+									cloudOctaves,
+									cloudFalloff,
+									cloudIntensity,
+									cloudRidginess,
+									cloudSmearScale,
+									cloudSmearOctaves,
+									cloudSmearFalloff,
+									cloudSmearIntensity,
+									cloudColour0,
+									cloudColour1,
+									cloudNoiseOffset,
+									cloudNoiseOffset );
+	
+	float a	= c.a * clamp( 1 - getOctaveWorley( p * cloudWorleyNoiseFrequency, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 );
+	a		+= c.a * clamp( 1 - getOctaveWorley( p * cloudWorleyNoiseFrequency * 2, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 ) * 0.5;
+	a		+= c.a * clamp( 1 - getOctaveWorley( p * cloudWorleyNoiseFrequency * 4, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 ) * 0.5;
+	float h	= a * 0.5;
+	a		= clamp( a, 0, 1 );
+	c		*= ( preMultiplyAlpha == 1 ? a : 1 );
+
+	resultData[ id.x * cloudPixelsPerThread ] = ( uint ) round( c.r * 255 ) << 24
+												| ( uint ) round( c.g * 255 ) << 16
+												| ( uint ) round( c.b * 255 ) << 8
+												| ( uint ) round( a * 255 * clamp( c.r + c.g + c.b, 0, 1 ) );
+
+	//height and normals
+	float3 px	= getPointOnSphere( ( x + dr ) * inW, v );
+	px.x		/= cloudSpin;
+	px.y		/= cloudSpin;
+	float3 py	= getPointOnSphere( u, ( y + dr ) * inH );
+	py.x		/= cloudSpin;
+	py.y		/= cloudSpin;
+
+	float hx	= getSurfaceHeight( px,
+									cloudScale,
+									cloudOctaves,
+									cloudFalloff,
+									cloudIntensity,
+									cloudRidginess,
+									cloudSmearScale,
+									cloudSmearOctaves,
+									cloudSmearFalloff,
+									cloudSmearIntensity,
+									cloudNoiseOffset,
+									cloudNoiseOffset );
+	float ax	= hx * clamp( 1 - getOctaveWorley( px * cloudWorleyNoiseFrequency, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 );
+	ax			+= hx * clamp( 1 - getOctaveWorley( px * cloudWorleyNoiseFrequency * 2, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 ) * 0.5;
+	ax			+= hx * clamp( 1 - getOctaveWorley( px * cloudWorleyNoiseFrequency * 4, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 ) * 0.5;
+	hx			= ax * 0.5;
+
+	float hy	= getSurfaceHeight( py,
+									cloudScale,
+									cloudOctaves,
+									cloudFalloff,
+									cloudIntensity,
+									cloudRidginess,
+									cloudSmearScale,
+									cloudSmearOctaves,
+									cloudSmearFalloff,
+									cloudSmearIntensity,
+									cloudNoiseOffset,
+									cloudNoiseOffset );
+	float ay	= hy * clamp( 1 - getOctaveWorley( py * cloudWorleyNoiseFrequency, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 );
+	ay			+= hy * clamp( 1 - getOctaveWorley( py * cloudWorleyNoiseFrequency * 2, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 ) * 0.5;
+	ay			+= hy * clamp( 1 - getOctaveWorley( py * cloudWorleyNoiseFrequency * 4, cloudWorleyNoiseOctaves, cloudWorleyNoiseAmplitude, cloudSeed ), 0, 1 ) * 0.5;
+	hy			= ay * 0.5;
+
+	float3 n	= float3( dr * inW, 0, hx - h );
+	n			*= 1000;			//prevents rounding errors in cross product below
+	float3 cr	= float3( 0, dr * inH, hy - h );
+	cr			*= 1000;			//prevents rounding errors in cross product below
+	n			= normalize( cross( n, cr ) );
+
+	n			= ( n * a * cloudNormalScale * 0.5 ) + float3( 0.5, 0.5, 0.5 );
+
+	resultData[ id.x * cloudPixelsPerThread + 1 ] = ( uint ) round( n.x * 255 ) << 24
+													| ( uint ) round( n.y * 255 ) << 16
+													| ( uint ) round( n.z * 255 ) << 8
+													| ( uint ) round( h * 255 );
+}
