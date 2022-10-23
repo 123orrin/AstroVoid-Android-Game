@@ -7,6 +7,6 @@ Key features of the project include:
   - Hierarchical Programming (System and subsystem managers)
   - Homemade sprites and feature art
   
-The app utilizes the Google Play API to manage its Play Store Integration and is able to log data, save player states, and check for internet connectivity. The storyline and tutorial are originally crafted with the hopes of giving the user a unique experience.
+The app utilizes the Google Play API to manage its Play Store Integration and is able to log data, save player states, and check for internet connectivity. The storyline and tutorial are originally crafted with hopes of giving the user a unique experience.
 
 I hope you enjoy!
